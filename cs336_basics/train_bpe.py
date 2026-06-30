@@ -4,11 +4,12 @@ from collections import Counter
 
 from .pretokenization_example import find_chunk_boundaries
 
-# corpus path 
-OWT_TRAIN_PATH = '../data/owt_train.txt' # 11.92 GB 
-OWT_VALID_PATH = '../data/owt_valid.txt' # 290 MB 
-TINYSTORIES_TRAIN_PATH = '../data/TinyStoriesV2-GPT4-train.txt' # 2.23 GB 
-TINYSTORIES_VALID_PATH = '../data/TinyStoriesV2-GPT4-valid.txt' # 22.5 MB
+# corpus path (anchored to repo root so it works regardless of CWD)
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+OWT_TRAIN_PATH = os.path.join(_DATA_DIR, 'owt_train.txt') # 11.92 GB
+OWT_VALID_PATH = os.path.join(_DATA_DIR, 'owt_valid.txt') # 290 MB
+TINYSTORIES_TRAIN_PATH = os.path.join(_DATA_DIR, 'TinyStoriesV2-GPT4-train.txt') # 2.23 GB
+TINYSTORIES_VALID_PATH = os.path.join(_DATA_DIR, 'TinyStoriesV2-GPT4-valid.txt') # 22.5 MB
 
 # end of document token 
 END_OF_TEXT_TOKEN = "<|endoftext|>"
@@ -16,11 +17,9 @@ END_OF_TEXT_TOKEN = "<|endoftext|>"
 # GPT-2 预处理正则
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-
 ########
-######## define pretoken count 
+######## Define pre-tokenization 
 ########
-
 """
 打开 corpus 文件
 → 找 chunk boundaries
@@ -86,7 +85,7 @@ def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
 
 
 #################
-###### vocabulary initlization + merge loop 
+###### vocabulary initlization + train BPE 
 ###############
 # 
 
@@ -120,6 +119,7 @@ def compute_pair_counts(
     
     return pair_counts
 
+
 def merge_pretoken(
     pretoken: tuple[bytes, ...],
     pair_to_merge: tuple[bytes, bytes],
@@ -140,6 +140,7 @@ def merge_pretoken(
             i += 1
 
     return tuple(merged)
+
 
 def merge_pair_in_counts(
     pretoken_counts: Counter[tuple[bytes, ...]],
@@ -208,3 +209,16 @@ def train_bpe(
     )
 
     return vocab, merges
+
+
+if __name__ == '__main__': 
+
+    special_tokens = [END_OF_TEXT_TOKEN]
+    vocab, merge = train_bpe(
+        TINYSTORIES_VALID_PATH, 
+        800,
+        special_tokens
+    )
+    
+    print(vocab)
+    print(merge)
