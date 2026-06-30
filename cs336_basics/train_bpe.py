@@ -1,7 +1,10 @@
 import os
-import regex as re 
+import json
+import regex as re
+from pathlib import Path
+from functools import lru_cache
 from collections import Counter
-from multiprocessing import Pool 
+from multiprocessing import Pool
 from .pretokenization_example import find_chunk_boundaries
 
 # corpus path (anchored to repo root so it works regardless of CWD)
@@ -343,3 +346,75 @@ def train_bpe(
     )
 
     return vocab, merges
+
+
+@lru_cache
+def gpt2_bytes_to_unicode() -> dict[int, str]:
+    """
+    GPT-2 byte-to-unicode mapping.
+
+    It maps each byte value 0..255 to a Unicode string character so that
+    arbitrary bytes can be represented safely in a JSON vocabulary.
+    """
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+
+    cs = bs[:]
+    n = 0
+
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+def encode_token_bytes_for_gpt2_json(token: bytes) -> str:
+    """
+    Convert a bytes token into GPT-2's reversible unicode string form.
+    """
+    byte_encoder = gpt2_bytes_to_unicode()
+    return "".join(byte_encoder[b] for b in token)
+
+
+def save_bpe(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    vocab_path: str | Path,
+    merges_path: str | Path,
+) -> None:
+    """
+    Save BPE vocab and merges in GPT-2-style format.
+
+    vocab.json format:
+        {token_str: token_id}
+
+    merges.txt format:
+        one merge per line, in merge order:
+        token1 token2
+    """
+    vocab_path = Path(vocab_path)
+    merges_path = Path(merges_path)
+
+    vocab_path.parent.mkdir(parents=True, exist_ok=True)
+    merges_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Important: vocab JSON direction is {token_str: id}, not {id: token_str}
+    encoded_vocab: dict[str, int] = {
+        encode_token_bytes_for_gpt2_json(token_bytes): token_id
+        for token_id, token_bytes in vocab.items()
+    }
+
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(encoded_vocab, f, ensure_ascii=False, indent=2)
+
+    with open(merges_path, "w", encoding="utf-8") as f:
+        for left, right in merges:
+            left_str = encode_token_bytes_for_gpt2_json(left)
+            right_str = encode_token_bytes_for_gpt2_json(right)
+            f.write(f"{left_str} {right_str}\n")
