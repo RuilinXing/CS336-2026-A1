@@ -1,6 +1,8 @@
 import os
 import regex as re 
 from collections import Counter
+from multiprocessing import Pool 
+
 
 from .pretokenization_example import find_chunk_boundaries
 
@@ -29,6 +31,7 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 → 统计 pre-token counts
 """
 
+# 单进程 per-tokenization 
 def count_pretokens(
     input_path: str | os.PathLike, 
     special_tokens: list[str],
@@ -73,6 +76,75 @@ def count_pretokens(
                     pretoken_counts[pretoken_bytes] += 1
             
     return pretoken_counts
+               
+
+def count_pretokens_in_chunk(
+    args: tuple[str, int, int, list[str]],
+) -> Counter[tuple[bytes, ...]]:
+    input_path, start, end, special_tokens = args
+
+    local_counts: Counter[tuple[bytes, ...]] = Counter()
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk_bytes = f.read(end - start)
+
+    chunk_text = chunk_bytes.decode("utf-8", errors="ignore")
+
+    for document in split_by_special_tokens(chunk_text, special_tokens):
+        for match in re.finditer(PAT, document):
+            pretoken = match.group()
+            pretoken_bytes = tuple(
+                bytes([b]) for b in pretoken.encode("utf-8")
+            )
+            local_counts[pretoken_bytes] += 1
+
+    return local_counts
+
+
+# multi-processing pre-tokenization 
+def count_pretokens_in_parallel(
+    input_path: str, 
+    special_tokens: list[str],
+    num_processes: int = 4
+)-> Counter[tuple[bytes, ...]]:     
+    with open(input_path, "rb") as f:
+        if not special_tokens: 
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell() 
+            f.seek(0) 
+            
+            boundaries = [0, file_size]
+        else: 
+            split_special_token = special_tokens[0].encode('utf-8')
+            
+            # 将文件拆分成 num_processes 个 boundaries
+            # 如 num_processes = 4, 将文件切分为4块独立连续的部分 
+            # e.g [0, 251203, 502991, 749882, 1000000]
+            boundaries = find_chunk_boundaries(
+                f, 
+                num_processes, 
+                split_special_token
+            )
+    
+    # workers 的 tasks pool, 每个task 为一个 chunk
+    tasks = [
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    total_counts = Counter()
+
+    # 分配给每个work 的任务
+    with Pool(processes=num_processes) as pool:
+        partial_counts_list = pool.map(count_pretokens_in_chunk, tasks)
+
+    for partial_counts in partial_counts_list:
+        total_counts.update(partial_counts)
+
+    return total_counts
+    
+      
                
 def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
     if not special_tokens:
@@ -189,11 +261,11 @@ def train_bpe_merge_loop(
 
 
 def train_bpe(
-    input_path: str | os.PathLike,
+    input_path: str,
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    pretoken_counts = count_pretokens(
+    pretoken_counts = count_pretokens_in_parallel(
         input_path=input_path,
         special_tokens=special_tokens,
     )
