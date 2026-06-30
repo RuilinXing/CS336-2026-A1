@@ -123,25 +123,6 @@ def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     return vocab
 
 
-""" 
-1. 统计所有相邻 token pair 的频率
-2. 找到频率最高的 pair
-3. 把这个 pair 合并成一个新 token
-4. 更新 pretoken_counts 和 vocab
-"""
-def compute_pair_counts(
-    pretoken_counts: Counter[tuple[bytes, ...]]
-) -> Counter[tuple[bytes, bytes]]: 
-    pair_counts = Counter() 
-    
-    for pretoken, count in pretoken_counts.items(): 
-        for i in range(len(pretoken) - 1): 
-            pair = (pretoken[i], pretoken[i+1])
-            pair_counts[pair] += count 
-    
-    return pair_counts
-
-
 def merge_pretoken(
     pretoken: tuple[bytes, ...],
     pair_to_merge: tuple[bytes, bytes],
@@ -162,52 +143,6 @@ def merge_pretoken(
             i += 1
 
     return tuple(merged)
-
-
-def merge_pair_in_counts(
-    pretoken_counts: Counter[tuple[bytes, ...]],
-    pair_to_merge: tuple[bytes, bytes],
-) -> Counter[tuple[bytes, ...]]:
-    new_counts = Counter()
-
-    for pretoken, count in pretoken_counts.items():
-        new_pretoken = merge_pretoken(pretoken, pair_to_merge)
-        new_counts[new_pretoken] += count
-
-    return new_counts
-
-
-def train_bpe_merge_loop(
-    pretoken_counts: Counter[tuple[bytes, ...]],
-    vocab: dict[int, bytes],
-    final_vocab_size: int 
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-
-    merges: list[tuple[bytes, bytes]] = []
-    
-    while len(vocab) < final_vocab_size:
-        pair_counts = compute_pair_counts(pretoken_counts)
-
-        # 没有任何 pair 可以继续 merge
-        if not pair_counts:
-            break
-
-        best_pair, _ = max(
-            pair_counts.items(),
-            key=lambda item: (item[1], item[0]),
-        )
-
-        new_token = best_pair[0] + best_pair[1]
-
-        vocab[len(vocab)] = new_token
-        merges.append(best_pair)
-
-        pretoken_counts = merge_pair_in_counts(
-            pretoken_counts,
-            best_pair,
-        )
-
-    return vocab, merges
 
 
 def get_adjacent_pairs(pretoken: Pretoken) -> list[Pair]:
@@ -263,9 +198,16 @@ def train_bpe_merge_loop_cached(
     pretoken_counts: Counter[Pretoken],
     vocab: dict[int, bytes],
     final_vocab_size: int,
+    verbose: bool = False,
+    log_every: int = 100,
 ) -> tuple[dict[int, bytes], list[Pair]]:
+    import time
+    import psutil
 
     merges: list[Pair] = []
+    target_merges = final_vocab_size - len(vocab)
+    start_time = time.perf_counter()
+    process = psutil.Process()
 
     # 避免直接修改外部传进来的 Counter
     pretoken_counts = Counter(pretoken_counts)
@@ -322,6 +264,18 @@ def train_bpe_merge_loop_cached(
                 pair_to_pretokens=pair_to_pretokens,
             )
 
+        # Progress log every `log_every` merges.
+        if verbose and len(merges) % log_every == 0:
+            elapsed = time.perf_counter() - start_time
+            rss_gb = process.memory_info().rss / 1024**3
+            print(
+                f"[merge {len(merges)}/{target_merges}] "
+                f"vocab={len(vocab)} "
+                f"rss={rss_gb:.2f}GB "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+
     return vocab, merges
 
 
@@ -329,10 +283,13 @@ def train_bpe(
     input_path: str,
     vocab_size: int,
     special_tokens: list[str],
+    num_processes: int = 4,
+    verbose: bool = False,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     pretoken_counts = count_pretokens_in_parallel(
         input_path=input_path,
         special_tokens=special_tokens,
+        num_processes=num_processes,
     )
 
     vocab = init_vocab(
@@ -343,6 +300,7 @@ def train_bpe(
         pretoken_counts=pretoken_counts,
         vocab=vocab,
         final_vocab_size=vocab_size,
+        verbose=verbose,
     )
 
     return vocab, merges
@@ -418,3 +376,37 @@ def save_bpe(
             left_str = encode_token_bytes_for_gpt2_json(left)
             right_str = encode_token_bytes_for_gpt2_json(right)
             f.write(f"{left_str} {right_str}\n")
+
+
+if __name__ == "__main__":
+    import time
+
+    INPUT_PATH = OWT_TRAIN_PATH
+    VOCAB_SIZE = 32_000
+    special_tokens = [END_OF_TEXT_TOKEN]
+    num_processes = 8
+
+    vocab_out = os.path.join(_DATA_DIR, "owt_vocab.json")
+    merges_out = os.path.join(_DATA_DIR, "owt_merges.txt")
+
+    print(f"Training BPE on {INPUT_PATH}")
+    print(f"  vocab_size={VOCAB_SIZE}, special_tokens={special_tokens}, num_processes={num_processes}")
+
+    start = time.perf_counter()
+    vocab, merges = train_bpe(
+        input_path=INPUT_PATH,
+        vocab_size=VOCAB_SIZE,
+        special_tokens=special_tokens,
+        num_processes=num_processes,
+        verbose=True,
+    )
+    elapsed = time.perf_counter() - start
+
+    save_bpe(vocab, merges, vocab_out, merges_out)
+
+    longest_token = max(vocab.values(), key=len)
+    print(f"Done in {elapsed:.1f}s")
+    print(f"  vocab size: {len(vocab)}  |  merges: {len(merges)}")
+    print(f"  longest token: {longest_token!r}  ({len(longest_token)} bytes)")
+    print(f"  saved vocab  -> {vocab_out}")
+    print(f"  saved merges -> {merges_out}")
