@@ -2,8 +2,6 @@ import os
 import regex as re 
 from collections import Counter
 from multiprocessing import Pool 
-
-
 from .pretokenization_example import find_chunk_boundaries
 
 # corpus path (anchored to repo root so it works regardless of CWD)
@@ -19,6 +17,9 @@ END_OF_TEXT_TOKEN = "<|endoftext|>"
 # GPT-2 预处理正则
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+Pretoken = tuple[bytes, ...]
+Pair = tuple[bytes, bytes]
+
 ########
 ######## Define pre-tokenization 
 ########
@@ -31,52 +32,6 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 → 统计 pre-token counts
 """
 
-# 单进程 per-tokenization 
-def count_pretokens(
-    input_path: str | os.PathLike, 
-    special_tokens: list[str],
-    num_processes: int = 4
-)-> Counter[tuple[bytes, ...]]: 
-    pretoken_counts = Counter()
-    
-    with open(input_path, "rb") as f:
-        if not special_tokens: 
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell() 
-            f.seek(0) 
-            
-            boundaries = [0, file_size]
-        else: 
-            split_special_token = special_tokens[0].encode('utf-8')
-            
-            # 将文件拆分成 num_processes 个 boundaries
-            # 如 num_processes = 4, 将文件切分为4块独立连续的部分 
-            # e.g [0, 251203, 502991, 749882, 1000000]
-            boundaries = find_chunk_boundaries(
-                f, 
-                num_processes, 
-                split_special_token
-            )
-    
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start) # 表示移动到这个 chunk 的开始位置
-            # 1. 读取 chunk 的 byte 内容
-            chunk_bytes = f.read(end - start)
-            # 2. decode from bytes to string
-            chunk_text = chunk_bytes.decode("utf-8", errors="ignore")  
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-
-            for document in split_by_special_tokens(chunk_text, special_tokens): 
-                for match in re.finditer(PAT, document): 
-                    pretoken = match.group() # 得到匹配pretoken的string表示形式
-                    # 将pretoken string形式编码成 utf-8  
-                    pretoken_bytes = tuple(bytes([b]) for b in pretoken.encode('utf-8'))
-                    pretoken_counts[pretoken_bytes] += 1
-            
-    return pretoken_counts
-               
 
 def count_pretokens_in_chunk(
     args: tuple[str, int, int, list[str]],
@@ -102,7 +57,7 @@ def count_pretokens_in_chunk(
     return local_counts
 
 
-# multi-processing pre-tokenization 
+# parallelizing pre-tokenization 
 def count_pretokens_in_parallel(
     input_path: str, 
     special_tokens: list[str],
@@ -145,7 +100,6 @@ def count_pretokens_in_parallel(
     return total_counts
     
       
-               
 def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
     if not special_tokens:
         return [text]
@@ -155,11 +109,6 @@ def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
 
     return re.split(pattern, text)
 
-
-#################
-###### vocabulary initlization + train BPE 
-###############
-# 
 
 def init_vocab(special_tokens: list[str]) -> dict[int, bytes]: 
     vocab: dict[int, bytes] = {} 
@@ -171,14 +120,12 @@ def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     return vocab
 
 
-### merge loop 
 """ 
 1. 统计所有相邻 token pair 的频率
 2. 找到频率最高的 pair
 3. 把这个 pair 合并成一个新 token
 4. 更新 pretoken_counts 和 vocab
 """
-
 def compute_pair_counts(
     pretoken_counts: Counter[tuple[bytes, ...]]
 ) -> Counter[tuple[bytes, bytes]]: 
@@ -234,7 +181,7 @@ def train_bpe_merge_loop(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
     merges: list[tuple[bytes, bytes]] = []
-
+    
     while len(vocab) < final_vocab_size:
         pair_counts = compute_pair_counts(pretoken_counts)
 
@@ -260,6 +207,121 @@ def train_bpe_merge_loop(
     return vocab, merges
 
 
+def get_adjacent_pairs(pretoken: Pretoken) -> list[Pair]:
+    return [
+        (pretoken[i], pretoken[i + 1])
+        for i in range(len(pretoken) - 1)
+    ]
+
+
+def initialize_pair_cache(
+    pretoken_counts: Counter[Pretoken],
+) -> tuple[Counter[Pair], dict[Pair, set[Pretoken]]]:
+    pair_counts: Counter[Pair] = Counter()
+    pair_to_pretokens: dict[Pair, set[Pretoken]] = {}
+
+    for pretoken, count in pretoken_counts.items():
+        for pair in get_adjacent_pairs(pretoken):
+            pair_counts[pair] += count
+            pair_to_pretokens.setdefault(pair, set()).add(pretoken)
+
+    return pair_counts, pair_to_pretokens
+
+
+def remove_pretoken_from_cache(
+    pretoken: Pretoken,
+    count: int,
+    pair_counts: Counter[Pair],
+    pair_to_pretokens: dict[Pair, set[Pretoken]],
+) -> None:
+    for pair in get_adjacent_pairs(pretoken):
+        pair_counts[pair] -= count
+
+        if pair in pair_to_pretokens:
+            pair_to_pretokens[pair].discard(pretoken)
+
+        if pair_counts[pair] <= 0:
+            del pair_counts[pair]
+            pair_to_pretokens.pop(pair, None)
+
+
+def add_pretoken_to_cache(
+    pretoken: Pretoken,
+    count: int,
+    pair_counts: Counter[Pair],
+    pair_to_pretokens: dict[Pair, set[Pretoken]],
+) -> None:
+    for pair in get_adjacent_pairs(pretoken):
+        pair_counts[pair] += count
+        pair_to_pretokens.setdefault(pair, set()).add(pretoken)
+
+
+def train_bpe_merge_loop_cached(
+    pretoken_counts: Counter[Pretoken],
+    vocab: dict[int, bytes],
+    final_vocab_size: int,
+) -> tuple[dict[int, bytes], list[Pair]]:
+
+    merges: list[Pair] = []
+
+    # 避免直接修改外部传进来的 Counter
+    pretoken_counts = Counter(pretoken_counts)
+
+    # 一开始只全量统计一次
+    pair_counts, pair_to_pretokens = initialize_pair_cache(pretoken_counts)
+
+    while len(vocab) < final_vocab_size:
+        if not pair_counts:
+            break
+
+        # 先按 frequency 最大选；频率相同选 lexicographically greater pair
+        best_pair, _ = max(
+            pair_counts.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+
+        new_token = best_pair[0] + best_pair[1]
+
+        vocab[len(vocab)] = new_token
+        merges.append(best_pair)
+
+        # 只更新包含 best_pair 的 pre-token
+        affected_pretokens = list(pair_to_pretokens.get(best_pair, set()))
+
+        for old_pretoken in affected_pretokens:
+            count = pretoken_counts.pop(old_pretoken, 0)
+
+            if count == 0:
+                continue
+
+            # 1. 删除 old_pretoken 对 pair_counts / index 的贡献
+            remove_pretoken_from_cache(
+                pretoken=old_pretoken,
+                count=count,
+                pair_counts=pair_counts,
+                pair_to_pretokens=pair_to_pretokens,
+            )
+
+            # 2. merge old_pretoken
+            new_pretoken = merge_pretoken(
+                pretoken=old_pretoken,
+                pair_to_merge=best_pair,
+            )
+
+            # 3. 加入新的 pre-token count
+            pretoken_counts[new_pretoken] += count
+
+            # 4. 加入 new_pretoken 对 pair_counts / index 的贡献
+            add_pretoken_to_cache(
+                pretoken=new_pretoken,
+                count=count,
+                pair_counts=pair_counts,
+                pair_to_pretokens=pair_to_pretokens,
+            )
+
+    return vocab, merges
+
+
 def train_bpe(
     input_path: str,
     vocab_size: int,
@@ -274,23 +336,10 @@ def train_bpe(
         special_tokens=special_tokens,
     )
 
-    vocab, merges = train_bpe_merge_loop(
+    vocab, merges = train_bpe_merge_loop_cached(
         pretoken_counts=pretoken_counts,
         vocab=vocab,
         final_vocab_size=vocab_size,
     )
 
     return vocab, merges
-
-
-if __name__ == '__main__': 
-
-    special_tokens = [END_OF_TEXT_TOKEN]
-    vocab, merge = train_bpe(
-        TINYSTORIES_VALID_PATH, 
-        800,
-        special_tokens
-    )
-    
-    print(vocab)
-    print(merge)
